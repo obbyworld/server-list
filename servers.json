@@ -820,7 +820,9 @@
     "description": "94 users, 92 channels on average (via netsplit.de).",
     "wss": "wss://irc.lizardirc.org:443/",
     "ircs": "ircs://irc.lizardirc.org:6697",
-    "obsidian": false
+    "obsidian": false,
+    "sasl": true,
+    "voice": false
   },
   {
     "name": "lowendirc.com",
