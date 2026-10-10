@@ -1129,7 +1129,9 @@
     "description": "39 users, 13 channels on average (via netsplit.de).",
     "wss": "wss://irc.serverfreakz.de:443/",
     "ircs": "ircs://irc.serverfreakz.de:6697",
-    "obsidian": false
+    "obsidian": false,
+    "sasl": true,
+    "voice": false
   },
   {
     "name": "Shelltalk",
@@ -1361,7 +1363,7 @@
     "wss": "wss://irc.unitedchat.org:443/",
     "ircs": "ircs://irc.unitedchat.org:6697",
     "obsidian": false,
-    "sasl": true,
+    "sasl": false,
     "voice": false
   },
   {
