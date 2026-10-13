@@ -6,6 +6,8 @@ This is where Obby's server list on the 'Discover' reads from.
 If you already know GitHub, you know what to do! 😉
 
 If not, all you need to do is edit this file, add your server in using the same format as the rest (JSON) of the servers, and then click to make a Pull Request from your newly created fork! 😁
+
+Leave out `users` and `channels`: the daily crawl reads them from your server and fills them in.
 ## Does The Change Happen Immediately?
 No, you will have to wait for one of our team to review your Pull Request. This should take a few hours, but may take a few days.
 

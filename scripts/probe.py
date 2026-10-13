@@ -35,7 +35,8 @@ connection for reachability and caps -- so the crawl never opens the rapid
 second connection per server that daemons reject.  The icon is downloaded into
 server-icons/ and rewritten only when it actually changed, so the list tracks
 the server's current icon without needless churn; the field is left empty for
-servers that advertise none.
+servers that advertise none.  The same welcome burst carries the LUSERS replies,
+so the crawl also records the network's current user and channel counts.
 
 Running it:
 
@@ -162,6 +163,8 @@ class TransportProbe:
     caps: dict[str, str]
     isupport: dict[str, str]
     complete: bool = False
+    users: int | None = None
+    channels: int | None = None
 
 
 @dataclass
@@ -179,6 +182,8 @@ class ServerResult:
     any_reachable: bool
     detected: Detection | None
     icon_url: str | None
+    users: int | None = None
+    channels: int | None = None
 
 
 @dataclass
@@ -195,6 +200,8 @@ class Server:
 
     name: str = ""
     description: str | None = None
+    users: int | None = None
+    channels: int | None = None
     wss: str | None = None
     ircs: str | None = None
     obsidian: bool | None = None
@@ -216,8 +223,9 @@ class Negotiator:
     continuation marker until the last.  In caps-only mode the handshake ends
     there.  When `register` is set we then complete registration (`CAP END`,
     the caller having already sent NICK/USER) and keep reading the welcome
-    burst to collect the RPL_ISUPPORT (005) tokens that carry the icon URL,
-    finishing at end-of-MOTD (376/422) or a registration error.
+    burst to collect the RPL_ISUPPORT (005) tokens that carry the icon URL and
+    the LUSERS counts, finishing at end-of-MOTD (376/422) or a registration
+    error.
     """
 
     # Numerics that end the welcome burst (success or terminal failure) and so
@@ -232,6 +240,10 @@ class Negotiator:
         self.caps_done = False
         self.finished = False
         self._nick_tries = 0
+        self._luser_client: int | None = None
+        self._global_users: int | None = None
+        self._channels: int | None = None
+        self._welcomed = False
 
     def feed(self, line: str) -> list[str]:
         line = line.rstrip()
@@ -246,7 +258,7 @@ class Negotiator:
         if "CAP" in parts:
             return self._feed_cap(parts, trailing)
         if len(parts) >= 2 and parts[1].isdigit():
-            return self._feed_numeric(parts[1], parts[3:])
+            return self._feed_numeric(parts[1], parts[3:], trailing)
         if parts and parts[0] == "ERROR":
             self.finished = True
         return []
@@ -267,8 +279,25 @@ class Negotiator:
             return []
         return ["CAP END"]
 
-    def _feed_numeric(self, code: str, params: list[str]) -> list[str]:
-        if code == "005":
+    @property
+    def users(self) -> int | None:
+        return self._global_users if self._global_users is not None else self._luser_client
+
+    @property
+    def channels(self) -> int | None:
+        # RFC 2812 sends RPL_LUSERCHANNELS only for a non-zero count.
+        if self._channels is None and self._welcomed and self.users is not None:
+            return 0
+        return self._channels
+
+    def _feed_numeric(self, code: str, params: list[str], trailing: str) -> list[str]:
+        if code == "251":
+            self._luser_client = luser_client_count(trailing)
+        elif code == "254" and params and params[0].isdigit():
+            self._channels = int(params[0])
+        elif code == "266":
+            self._global_users = global_users_count(params, trailing)
+        elif code == "005":
             for token in params:
                 name, _, value = token.partition("=")
                 self.isupport[name] = value
@@ -279,8 +308,30 @@ class Negotiator:
                 return [f"NICK {self.nick}"]
             self.finished = True
         elif code in self._REGISTRATION_END:
+            self._welcomed = code in ("376", "422")
             self.finished = True
         return []
+
+
+_LUSER_CLIENT = re.compile(r"(\d+)\D+?(\d+) invisible")
+_FIRST_NUMBER = re.compile(r"\d+")
+
+
+def luser_client_count(trailing: str) -> int | None:
+    """RPL_LUSERCLIENT reads "There are <visible> users and <invisible> invisible
+    on <n> servers"; the network's users are both kinds together."""
+    match = _LUSER_CLIENT.search(trailing)
+    return int(match[1]) + int(match[2]) if match else None
+
+
+def global_users_count(params: list[str], trailing: str) -> int | None:
+    """RPL_GLOBALUSERS carries the current count as its first parameter on most
+    daemons, and only inside the text ("Current global users 42, max 99") on
+    the rest."""
+    if params and params[0].isdigit():
+        return int(params[0])
+    match = _FIRST_NUMBER.search(trailing)
+    return int(match[0]) if match else None
 
 
 def detect(caps: dict[str, str]) -> Detection:
@@ -414,7 +465,9 @@ async def _attempt_wss(url: str, timeout: float, register: bool) -> TransportPro
         error = f"{type(exc).__name__}: {exc}".strip()
     if not nego.caps_done and error is None:
         error = "connection closed before capability list"
-    return TransportProbe("wss", url, nego.caps_done, error, nego.caps, nego.isupport, nego.finished)
+    return TransportProbe(
+        "wss", url, nego.caps_done, error, nego.caps, nego.isupport, nego.finished, nego.users, nego.channels
+    )
 
 
 async def probe_ircs(url: str, timeout: float, register: bool) -> TransportProbe:
@@ -462,7 +515,9 @@ async def _attempt_ircs(url: str, timeout: float, register: bool) -> TransportPr
                 pass
     if not nego.caps_done and error is None:
         error = "connection closed before capability list"
-    return TransportProbe("ircs", url, nego.caps_done, error, nego.caps, nego.isupport, nego.finished)
+    return TransportProbe(
+        "ircs", url, nego.caps_done, error, nego.caps, nego.isupport, nego.finished, nego.users, nego.channels
+    )
 
 
 async def probe_server(entry: Server, timeout: float) -> ServerResult:
@@ -518,12 +573,15 @@ async def crawl_server(entry: Server, timeout: float) -> tuple[ServerResult, lis
         merged_isupport.update(probe.isupport)
 
     any_reachable = any(p.reachable for p in probes)
+    counted = next((p for p in probes if p.users is not None and p.channels is not None), None)
     result = ServerResult(
         name=entry.name or "?",
         endpoints=[EndpointStatus(p.transport, p.url, p.reachable, p.error) for p in probes],
         any_reachable=any_reachable,
         detected=detect(merged_caps) if any_reachable else None,
         icon_url=icon_url_from(merged_isupport),
+        users=counted.users if counted else None,
+        channels=counted.channels if counted else None,
     )
     failures = [f"{p.transport}: {p.error}" for p in probes if not p.complete and p.error]
     return result, failures
@@ -676,7 +734,7 @@ def apply_corrections(
 
     Only ever adds or updates: an icon is set when a fresh one was downloaded
     this run, and a server whose icon could not be re-fetched keeps the one it
-    already had.  Nothing is removed unless `prune` is set -- the default crawl
+    already had.  User and channel counts follow the same rule.  Nothing is removed unless `prune` is set -- the default crawl
     never drops a server or an icon, so a network that blocks the runner's IP
     (and so looks unreachable from CI) can't propose deleting a live entry.
     With `prune`, servers unreachable from where this ran are dropped (use only
@@ -703,11 +761,18 @@ def apply_corrections(
             if fetched_icon and fetched_icon != entry.icon:
                 icon_changes.append(f"{result.name}: icon {entry.icon} -> {fetched_icon}")
                 entry.icon = fetched_icon
+            if result.users is not None and result.channels is not None:
+                entry.users = result.users
+                entry.channels = result.channels
         updated.append(entry)
     return updated, changes, removed, icon_changes
 
 
 _MARK = {True: "✅", False: "❌", None: "—"}
+
+
+def _count(value: int | None) -> str:
+    return "—" if value is None else str(value)
 
 
 def render_report(
@@ -726,7 +791,10 @@ def render_report(
         lines += ["No connectivity-affecting changes to validate. ✅", ""]
         return "\n".join(lines) + "\n"
 
-    lines += ["| Server | wss | ircs | obsidian | sasl | voice | icon |", "|---|---|---|---|---|---|---|"]
+    lines += [
+        "| Server | wss | ircs | obsidian | sasl | voice | icon | users | channels |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
     for r in results:
         by_transport = {e.transport: e for e in r.endpoints}
 
@@ -742,7 +810,8 @@ def render_report(
         icon_cell = _MARK[bool(r.icon_url)] if icons_checked else "—"
         lines.append(
             f"| {r.name} | {cell('wss')} | {cell('ircs')} | "
-            f"{flag('obsidian')} | {flag('sasl')} | {flag('voice')} | {icon_cell} |"
+            f"{flag('obsidian')} | {flag('sasl')} | {flag('voice')} | {icon_cell} | "
+            f"{_count(r.users)} | {_count(r.channels)} |"
         )
 
     removed_set = set(removed)
