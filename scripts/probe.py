@@ -223,8 +223,8 @@ class Negotiator:
     continuation marker until the last.  In caps-only mode the handshake ends
     there.  When `register` is set we then complete registration (`CAP END`,
     the caller having already sent NICK/USER) and keep reading the welcome
-    burst to collect the RPL_ISUPPORT (005) tokens that carry the icon URL and
-    the LUSERS counts, finishing at end-of-MOTD (376/422) or a registration
+    burst to collect the RPL_ISUPPORT (005) tokens that carry the icon URL, and
+    the LUSERS replies, finishing at end-of-MOTD (376/422) or a registration
     error.
     """
 
@@ -285,7 +285,7 @@ class Negotiator:
 
     @property
     def channels(self) -> int | None:
-        # RFC 2812 sends RPL_LUSERCHANNELS only for a non-zero count.
+        # RFC 2812 servers omit RPL_LUSERCHANNELS when no channels exist, so we read its absence as zero.
         if self._channels is None and self._welcomed and self.users is not None:
             return 0
         return self._channels
@@ -293,7 +293,7 @@ class Negotiator:
     def _feed_numeric(self, code: str, params: list[str], trailing: str) -> list[str]:
         if code == "251":
             self._luser_client = luser_client_count(trailing)
-        elif code == "254" and params and params[0].isdigit():
+        elif code == "254" and params and _COUNT.fullmatch(params[0]):
             self._channels = int(params[0])
         elif code == "266":
             self._global_users = global_users_count(params, trailing)
@@ -313,8 +313,9 @@ class Negotiator:
         return []
 
 
-_LUSER_CLIENT = re.compile(r"(\d+)\D+?(\d+) invisible")
-_FIRST_NUMBER = re.compile(r"\d+")
+# Servers are untrusted, so we accept only short ASCII digit runs that int() always parses.
+_COUNT = re.compile(r"\d{1,9}", re.ASCII)
+_LUSER_CLIENT = re.compile(r"(\d{1,9})\D+?(\d{1,9}) invisible", re.ASCII)
 
 
 def luser_client_count(trailing: str) -> int | None:
@@ -328,9 +329,9 @@ def global_users_count(params: list[str], trailing: str) -> int | None:
     """RPL_GLOBALUSERS carries the current count as its first parameter on most
     daemons, and only inside the text ("Current global users 42, max 99") on
     the rest."""
-    if params and params[0].isdigit():
+    if params and _COUNT.fullmatch(params[0]):
         return int(params[0])
-    match = _FIRST_NUMBER.search(trailing)
+    match = _COUNT.search(trailing)
     return int(match[0]) if match else None
 
 
@@ -466,7 +467,8 @@ async def _attempt_wss(url: str, timeout: float, register: bool) -> TransportPro
     if not nego.caps_done and error is None:
         error = "connection closed before capability list"
     return TransportProbe(
-        "wss", url, nego.caps_done, error, nego.caps, nego.isupport, nego.finished, nego.users, nego.channels
+        "wss", url, nego.caps_done, error, nego.caps, nego.isupport,
+        complete=nego.finished, users=nego.users, channels=nego.channels,
     )
 
 
@@ -516,7 +518,8 @@ async def _attempt_ircs(url: str, timeout: float, register: bool) -> TransportPr
     if not nego.caps_done and error is None:
         error = "connection closed before capability list"
     return TransportProbe(
-        "ircs", url, nego.caps_done, error, nego.caps, nego.isupport, nego.finished, nego.users, nego.channels
+        "ircs", url, nego.caps_done, error, nego.caps, nego.isupport,
+        complete=nego.finished, users=nego.users, channels=nego.channels,
     )
 
 
@@ -734,7 +737,8 @@ def apply_corrections(
 
     Only ever adds or updates: an icon is set when a fresh one was downloaded
     this run, and a server whose icon could not be re-fetched keeps the one it
-    already had.  User and channel counts follow the same rule.  Nothing is removed unless `prune` is set -- the default crawl
+    already had.  User and channel counts follow the same rule.  Nothing is
+    removed unless `prune` is set -- the default crawl
     never drops a server or an icon, so a network that blocks the runner's IP
     (and so looks unreachable from CI) can't propose deleting a live entry.
     With `prune`, servers unreachable from where this ran are dropped (use only
@@ -772,7 +776,7 @@ _MARK = {True: "✅", False: "❌", None: "—"}
 
 
 def _count(value: int | None) -> str:
-    return "—" if value is None else str(value)
+    return _MARK[None] if value is None else str(value)
 
 
 def render_report(
@@ -791,9 +795,11 @@ def render_report(
         lines += ["No connectivity-affecting changes to validate. ✅", ""]
         return "\n".join(lines) + "\n"
 
+    # Only the crawl registers, so only the crawl has counts to show.
+    count_columns = " users | channels |" if icons_checked else ""
     lines += [
-        "| Server | wss | ircs | obsidian | sasl | voice | icon | users | channels |",
-        "|---|---|---|---|---|---|---|---|---|",
+        f"| Server | wss | ircs | obsidian | sasl | voice | icon |{count_columns}",
+        "|---|---|---|---|---|---|---|" + ("---|---|" if icons_checked else ""),
     ]
     for r in results:
         by_transport = {e.transport: e for e in r.endpoints}
@@ -808,10 +814,10 @@ def render_report(
             return _MARK[getattr(r.detected, name)]
 
         icon_cell = _MARK[bool(r.icon_url)] if icons_checked else "—"
+        count_cells = f" {_count(r.users)} | {_count(r.channels)} |" if icons_checked else ""
         lines.append(
             f"| {r.name} | {cell('wss')} | {cell('ircs')} | "
-            f"{flag('obsidian')} | {flag('sasl')} | {flag('voice')} | {icon_cell} | "
-            f"{_count(r.users)} | {_count(r.channels)} |"
+            f"{flag('obsidian')} | {flag('sasl')} | {flag('voice')} | {icon_cell} |{count_cells}"
         )
 
     removed_set = set(removed)
@@ -836,6 +842,10 @@ def render_report(
     if icon_changes:
         lines += ["", "### Icon updates", ""]
         lines += [f"- {c}" for c in icon_changes]
+    stale_counts = [r.name for r in results if r.users is None] if icons_checked else []
+    if stale_counts:
+        lines += ["", "### User counts not refreshed (previous numbers kept)", ""]
+        lines += [f"- {name}" for name in stale_counts]
     if harvest_failures:
         lines += ["", "### Icon harvest failed — could not read ISUPPORT", ""]
         lines += [f"- **{name}** — {'; '.join(errs)}" for name, errs in harvest_failures]
