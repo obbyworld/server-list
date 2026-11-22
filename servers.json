@@ -24,18 +24,6 @@
     "icon": "server-icons/unrealircd-support-test-network.ico"
   },
   {
-    "name": "InspIRCd Test Network",
-    "description": "InspIRCd's Test Network for testing IRCv3 things.",
-    "users": 25,
-    "channels": 11,
-    "wss": "wss://testnet.inspircd.org:8097",
-    "ircs": "ircs://testnet.inspircd.org:6697",
-    "obsidian": false,
-    "sasl": true,
-    "voice": false,
-    "icon": "server-icons/inspircd-test-network.png"
-  },
-  {
     "name": "Ergo Test Network",
     "description": "Ergo's Test Network for testing IRCv3 things.",
     "users": 32,
